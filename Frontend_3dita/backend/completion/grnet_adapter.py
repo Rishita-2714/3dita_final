@@ -91,6 +91,15 @@ class GRNetAdapter:
             self._validated = True
             return False
 
+        # Allow geometric-mode bypass: if inference_mode.txt says "geometric",
+        # the inference script runs without a trained checkpoint.
+        _inference_mode_file = self._repo_path / "inference_mode.txt"
+        if (_inference_mode_file.exists()
+                and "geometric" in _inference_mode_file.read_text().lower()):
+            self._availability_reason = ""
+            self._validated = True
+            return True
+
         if not self._checkpoint_path.exists():
             self._availability_reason = "checkpoint-missing"
             self._validated = True

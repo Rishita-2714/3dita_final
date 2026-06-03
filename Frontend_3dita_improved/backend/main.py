@@ -513,8 +513,15 @@ def transfer_vertex_colors(mesh, reference_cloud):
     mesh_colors = np.zeros((len(vertices), 3))
 
     for index, vertex in enumerate(vertices):
-        _, indices, _ = kdtree.search_knn_vector_3d(vertex, 1)
-        mesh_colors[index] = reference_colors[indices[0]]
+        # Use 3 nearest neighbours with inverse-distance weighting so colours
+        # blend smoothly at triangle boundaries instead of hard k=1 snapping.
+        k, indices, distances_sq = kdtree.search_knn_vector_3d(vertex, 3)
+        if k == 0:
+            continue
+        distances = np.sqrt(np.maximum(np.asarray(distances_sq[:k]), 1e-12))
+        weights = 1.0 / distances
+        weights /= weights.sum()
+        mesh_colors[index] = (reference_colors[np.asarray(indices[:k])] * weights[:, None]).sum(axis=0)
 
     mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors)
     return mesh
@@ -573,9 +580,9 @@ def finalize_mesh(mesh, processed_cloud, color_reference_cloud, profile: str, vo
         return mesh
 
     bbox = processed_cloud.get_axis_aligned_bounding_box()
-    # Use a larger scale factor so reconstructed temple geometry that extends
-    # slightly beyond the input point cloud bounding box is not clipped.
-    mesh = mesh.crop(bbox.scale(1.15, bbox.get_center()))
+    # Use a tight crop (1.04×) so Poisson geometry that extends beyond the
+    # actual scan footprint — e.g. flat caps over ring openings — is removed.
+    mesh = mesh.crop(bbox.scale(1.04, bbox.get_center()))
     mesh.remove_duplicated_vertices()
     mesh.remove_duplicated_triangles()
     mesh.remove_degenerate_triangles()
@@ -583,7 +590,9 @@ def finalize_mesh(mesh, processed_cloud, color_reference_cloud, profile: str, vo
     mesh.remove_unreferenced_vertices()
 
     if len(mesh.triangles) > 0:
-        mesh = edge_aware_bilateral_smooth_mesh(mesh, iterations=1)
+        # NOTE: bilateral smoothing intentionally removed — it rounds off worn
+        # edges and surface texture, making archaeological artefacts look like
+        # modern smooth objects instead of real stone.
         mesh.remove_degenerate_triangles()
         mesh.remove_duplicated_triangles()
         mesh.remove_unreferenced_vertices()
@@ -621,21 +630,20 @@ def reconstruct_with_poisson(processed_cloud, profile: str, params: Dict[str, An
 
     densities_array = np.asarray(densities)
     if densities_array.size:
-        # Use conservative quantiles to preserve sparse but real temple geometry
-        # (damaged areas, fine spire detail) that higher thresholds would trim.
-        density_quantile = 0.003 if profile == "hq" else 0.006 if profile == "balanced" else 0.010
+        # Remove low-density vertices — these are Poisson "infill" faces that
+        # the algorithm creates to close hollow shapes (ring centres, cavities).
+        # They have near-zero density because no input points are near them.
+        # Raising the threshold to 20-30% aggressively removes the flat white
+        # caps and spiky bottom infill that Poisson adds to open/ring-shaped
+        # archaeological objects, without touching the real scan surface which
+        # has 5-20x higher density than the infill vertices.
+        density_quantile = 0.20 if profile == "hq" else 0.25 if profile == "balanced" else 0.30
         density_threshold = float(np.quantile(densities_array, density_quantile))
         low_density_vertices = densities_array < density_threshold
         mesh.remove_vertices_by_mask(low_density_vertices)
 
-    if len(mesh.triangles) > 0:
-        mesh = mesh.filter_smooth_laplacian(
-            number_of_iterations=5,
-            lambda_filter=0.5,
-        )
-        mesh.remove_degenerate_triangles()
-        mesh.remove_duplicated_triangles()
-        mesh.remove_unreferenced_vertices()
+    # NOTE: Laplacian smoothing intentionally removed — it destroys the worn-stone
+    # surface roughness of archaeological artefacts, making them look plastic/waxy.
 
     return mesh
 
@@ -771,6 +779,9 @@ def repair_mesh_holes_with_trimesh(mesh):
         repaired_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(repaired.vertices, dtype=np.float64))
         repaired_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(repaired.faces, dtype=np.int32))
         repaired_mesh.compute_vertex_normals()
+        # Restore original vertex colors that were stripped during trimesh conversion
+        if mesh.has_vertex_colors():
+            repaired_mesh = transfer_vertex_colors(repaired_mesh, mesh)
 
         return repaired_mesh, {
             "trimesh_fill_holes_used": True,
@@ -1004,9 +1015,9 @@ def fill_mesh_boundary_holes(mesh, color_reference_cloud, profile: str):
     filled_mesh.remove_unreferenced_vertices()
     filled_mesh.compute_vertex_normals()
 
-    if len(patch_vertex_indices) > 0:
-        filled_mesh = filled_mesh.filter_smooth_laplacian(number_of_iterations=5, lambda_filter=0.5)
-        filled_mesh.compute_vertex_normals()
+    # NOTE: whole-mesh Laplacian smoothing removed — it caused rippling artifacts
+    # at the boundary between real scan geometry and the hole-fill patches.
+    filled_mesh.compute_vertex_normals()
 
     filled_mesh = transfer_vertex_colors(filled_mesh, color_reference_cloud)
     if filled_mesh.has_vertex_colors():

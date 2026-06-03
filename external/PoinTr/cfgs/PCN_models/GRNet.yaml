@@ -1,0 +1,18 @@
+model:
+  NAME: GRNet
+  ENCODER: PointNet
+  DECODER: FC
+  N_INPUT_POINTS: 2048
+  N_OUTPUT_POINTS: 2048
+
+dataset:
+  TRAIN_DATASET: PCNDataset
+  TEST_DATASET: PCNDataset
+  N_POINTS: 2048
+
+train:
+  BATCH_SIZE: 32
+  LEARNING_RATE: 0.001
+
+test:
+  BATCH_SIZE: 1

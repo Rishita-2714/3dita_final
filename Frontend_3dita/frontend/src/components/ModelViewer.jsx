@@ -50,12 +50,12 @@ function SurfaceMesh({ geometry, mode, hasVertexColors, colorOverride }) {
     ? "#FFFFFF"
     : colorOverride ||
       (mode === "before"
-      ? "#D8B25F"
+      ? "#9E9E9E"
       : mode === "added"
         ? "#00FF40"
         : mode === "added_context"
           ? "#233128"
-        : "#E2C48A");
+        : "#B0A898");
 
   if (!geometry) {
     return null;
@@ -65,9 +65,9 @@ function SurfaceMesh({ geometry, mode, hasVertexColors, colorOverride }) {
     <mesh geometry={geometry} castShadow receiveShadow>
       <meshStandardMaterial
         color={color}
-        roughness={0.82}
-        metalness={0.03}
-        flatShading={false}
+        roughness={isAdded ? 0.82 : 1.0}
+        metalness={0}
+        flatShading={!isContext && !isAdded}
         vertexColors={useVertexColors}
         side={DoubleSide}
         wireframe={isContext}

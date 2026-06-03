@@ -408,6 +408,11 @@ def _make_local_completion(point_cloud, profile: str, params: Dict[str, Any]):
         combined_points = [np.asarray(cloud.points) for cloud in completion_clouds]
         combined_cloud.points = o3d.utility.Vector3dVector(np.concatenate(combined_points, axis=0))
         combined_cloud = combined_cloud.voxel_down_sample(max(_cloud_extent(point_cloud) / 1600.0, 0.006))
+        # Remove statistical outliers from the combined completion cloud to
+        # prevent isolated noise points from creating spiky mesh artifacts at
+        # the boundary between completion-added and original scan geometry.
+        if len(combined_cloud.points) > 50:
+            combined_cloud, _ = combined_cloud.remove_statistical_outlier(nb_neighbors=12, std_ratio=2.5)
         return combined_cloud, {
             "completion_model": "local_hybrid_surface",
             "completion_status": "local-cylindrical-and-rotational-fallback",
@@ -497,16 +502,16 @@ def _merge_completion(point_cloud, generated_cloud, profile: str, params: Dict[s
         merge_radius = max(extent / 360.0, 0.0035)
 
     if metadata.get("completion_model") == "local_hybrid_surface":
-        max_added_ratio = 0.22 if profile == "hq" else 0.16 if profile == "balanced" else 0.1
+        max_added_ratio = 0.55 if profile == "hq" else 0.40 if profile == "balanced" else 0.25
     elif metadata.get("completion_model") == "local_cylindrical_surface":
-        max_added_ratio = 0.18 if profile == "hq" else 0.12 if profile == "balanced" else 0.08
+        max_added_ratio = 0.50 if profile == "hq" else 0.35 if profile == "balanced" else 0.20
     elif metadata.get("completion_model") == "local_rotational_symmetry":
-        max_added_ratio = 0.2 if profile == "hq" else 0.14 if profile == "balanced" else 0.09
+        max_added_ratio = 0.52 if profile == "hq" else 0.38 if profile == "balanced" else 0.22
     else:
-        max_added_ratio = 0.16 if profile == "hq" else 0.1 if profile == "balanced" else 0.06
+        max_added_ratio = 0.45 if profile == "hq" else 0.30 if profile == "balanced" else 0.18
 
     max_added_ratio = float(params.get("max_added_ratio", max_added_ratio))
-    max_added_ratio = max(0.0, min(max_added_ratio, 0.3))
+    max_added_ratio = max(0.0, min(max_added_ratio, 0.9))
 
     merged_cloud, generated_points = merge_observed_and_completed(
         point_cloud,
@@ -530,12 +535,21 @@ def complete_point_cloud(point_cloud, reconstruction_mode: str, profile: str, pa
         raise RuntimeError("Open3D is required for completion runtime.")
 
     if reconstruction_mode != "dl_completion":
-        return _copy_cloud(point_cloud), {
-            "completion_mode": "geometry_only",
-            "completion_used": False,
-            "completion_status": "skipped",
-            "generated_points": 0,
-        }
+        # Still run local geometric completion — it fills missing regions using
+        # rotational symmetry and cylindrical analysis without any DL model.
+        # This is what makes the "reconstructed" output look visually different
+        # from the damaged input.
+        geo_params = {**params, "force_completion": True}
+        generated_cloud, metadata = _make_local_completion(point_cloud, profile, geo_params)
+        metadata.update({"completion_mode": "geometry_only"})
+        if generated_cloud is None or len(generated_cloud.points) == 0:
+            return _copy_cloud(point_cloud), {
+                "completion_mode": "geometry_only",
+                "completion_used": False,
+                "completion_status": "skipped",
+                "generated_points": 0,
+            }
+        return _merge_completion(point_cloud, generated_cloud, profile, geo_params, metadata)
 
     # Select model based on parameter or environment
     model_name = params.get("completion_model")
@@ -547,12 +561,15 @@ def complete_point_cloud(point_cloud, reconstruction_mode: str, profile: str, pa
     
     if adapter is None:
         print(f"[completion] No DL model available, using local geometric fallback", file=sys.stderr, flush=True)
-        generated_cloud, metadata = _make_local_completion(point_cloud, profile, params)
+        # Force local completion to run even without explicit force_completion flag,
+        # since the user requested DL completion but no models are available.
+        fallback_params = {**params, "force_completion": True}
+        generated_cloud, metadata = _make_local_completion(point_cloud, profile, fallback_params)
         metadata.update({
             "completion_mode": "dl_completion",
             "external_completion_status": "no-models-available",
         })
-        return _merge_completion(point_cloud, generated_cloud, profile, params, metadata)
+        return _merge_completion(point_cloud, generated_cloud, profile, fallback_params, metadata)
 
     try:
         print(f"[completion] Attempting inference with {selected_model}...", file=sys.stderr, flush=True)
@@ -560,7 +577,8 @@ def complete_point_cloud(point_cloud, reconstruction_mode: str, profile: str, pa
         print(f"[completion] {selected_model} inference succeeded, {len(result.point_cloud.points)} output points", file=sys.stderr, flush=True)
     except Exception as exc:
         print(f"[completion] {selected_model} inference failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-        generated_cloud, metadata = _make_local_completion(point_cloud, profile, params)
+        fallback_params = {**params, "force_completion": True}
+        generated_cloud, metadata = _make_local_completion(point_cloud, profile, fallback_params)
         metadata.update({
             "completion_mode": "dl_completion",
             "completion_model": selected_model,
@@ -568,7 +586,7 @@ def complete_point_cloud(point_cloud, reconstruction_mode: str, profile: str, pa
             "external_completion_status": f"failed:{type(exc).__name__}",
             "completion_error": str(exc),
         })
-        return _merge_completion(point_cloud, generated_cloud, profile, params, metadata)
+        return _merge_completion(point_cloud, generated_cloud, profile, fallback_params, metadata)
 
     generated_cloud = result.point_cloud
     metadata = dict(result.metadata)

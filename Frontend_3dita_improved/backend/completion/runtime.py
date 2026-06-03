@@ -401,6 +401,11 @@ def _make_local_completion(point_cloud, profile: str, params: Dict[str, Any]):
         combined_points = [np.asarray(cloud.points) for cloud in completion_clouds]
         combined_cloud.points = o3d.utility.Vector3dVector(np.concatenate(combined_points, axis=0))
         combined_cloud = combined_cloud.voxel_down_sample(max(_cloud_extent(point_cloud) / 1600.0, 0.006))
+        # Remove statistical outliers from the combined completion cloud to
+        # prevent isolated noise points from creating spiky mesh artifacts at
+        # the boundary between completion-added and original scan geometry.
+        if len(combined_cloud.points) > 50:
+            combined_cloud, _ = combined_cloud.remove_statistical_outlier(nb_neighbors=12, std_ratio=2.5)
         return combined_cloud, {
             "completion_model": "local_hybrid_surface",
             "completion_status": "local-cylindrical-and-rotational-fallback",
@@ -520,12 +525,21 @@ def complete_point_cloud(point_cloud, reconstruction_mode: str, profile: str, pa
         raise RuntimeError("Open3D is required for completion runtime.")
 
     if reconstruction_mode != "dl_completion":
-        return _copy_cloud(point_cloud), {
-            "completion_mode": "geometry_only",
-            "completion_used": False,
-            "completion_status": "skipped",
-            "generated_points": 0,
-        }
+        # Still run local geometric completion — it fills missing regions using
+        # rotational symmetry and cylindrical analysis without any DL model.
+        # This is what makes the "reconstructed" output look visually different
+        # from the damaged input.
+        geo_params = {**params, "force_completion": True}
+        generated_cloud, metadata = _make_local_completion(point_cloud, profile, geo_params)
+        metadata.update({"completion_mode": "geometry_only"})
+        if generated_cloud is None or len(generated_cloud.points) == 0:
+            return _copy_cloud(point_cloud), {
+                "completion_mode": "geometry_only",
+                "completion_used": False,
+                "completion_status": "skipped",
+                "generated_points": 0,
+            }
+        return _merge_completion(point_cloud, generated_cloud, profile, geo_params, metadata)
 
     # Select model based on parameter or environment
     model_name = params.get("completion_model")

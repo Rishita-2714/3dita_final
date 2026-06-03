@@ -509,8 +509,15 @@ def transfer_vertex_colors(mesh, reference_cloud):
     mesh_colors = np.zeros((len(vertices), 3))
 
     for index, vertex in enumerate(vertices):
-        _, indices, _ = kdtree.search_knn_vector_3d(vertex, 1)
-        mesh_colors[index] = reference_colors[indices[0]]
+        # Use 3 nearest neighbours with inverse-distance weighting so colours
+        # blend smoothly at triangle boundaries instead of hard k=1 snapping.
+        k, indices, distances_sq = kdtree.search_knn_vector_3d(vertex, 3)
+        if k == 0:
+            continue
+        distances = np.sqrt(np.maximum(np.asarray(distances_sq[:k]), 1e-12))
+        weights = 1.0 / distances
+        weights /= weights.sum()
+        mesh_colors[index] = (reference_colors[np.asarray(indices[:k])] * weights[:, None]).sum(axis=0)
 
     mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors)
     return mesh
@@ -569,15 +576,20 @@ def finalize_mesh(mesh, processed_cloud, color_reference_cloud, profile: str, vo
         return mesh
 
     bbox = processed_cloud.get_axis_aligned_bounding_box()
-    mesh = mesh.crop(bbox.scale(1.15, bbox.get_center()))
+    # Use a tight crop (1.04×) so Poisson geometry that extends beyond the
+    # actual scan footprint — e.g. flat caps over ring openings — is removed.
+    mesh = mesh.crop(bbox.scale(1.04, bbox.get_center()))
     mesh.remove_duplicated_vertices()
     mesh.remove_duplicated_triangles()
     mesh.remove_degenerate_triangles()
-    mesh.remove_non_manifold_edges()
+    # NOTE: do NOT call remove_non_manifold_edges() here — it destroys the
+    # low-density Poisson fill triangles that naturally close inner holes.
     mesh.remove_unreferenced_vertices()
 
     if len(mesh.triangles) > 0:
-        mesh = edge_aware_bilateral_smooth_mesh(mesh, iterations=1)
+        # NOTE: bilateral smoothing intentionally removed — it rounds off worn
+        # edges and surface texture, making archaeological artefacts look like
+        # modern smooth objects instead of real stone.
         mesh.remove_degenerate_triangles()
         mesh.remove_duplicated_triangles()
         mesh.remove_unreferenced_vertices()
@@ -589,15 +601,16 @@ def finalize_mesh(mesh, processed_cloud, color_reference_cloud, profile: str, vo
 
 def reconstruct_with_poisson(processed_cloud, profile: str, params: Dict[str, Any]):
     requested_detail = int(params.get("detail", 10 if profile == "hq" else 9 if profile == "balanced" else 8))
-    requested_detail = max(6, min(8, requested_detail))
+    max_depth = 11 if profile == "hq" else 10 if profile == "balanced" else 9
+    requested_detail = max(6, min(max_depth, requested_detail))
     if len(processed_cloud.points) > 90_000 and not params.get("full_resolution_meshing", False):
-        requested_detail = min(requested_detail, 7)
+        requested_detail = min(requested_detail, max_depth - 1)
     if len(processed_cloud.points) < 250_000:
-        depth = min(8, requested_detail)
+        depth = min(max_depth, requested_detail)
     elif len(processed_cloud.points) < 650_000:
-        depth = min(8, max(6, requested_detail - 1))
+        depth = min(max_depth, max(6, requested_detail - 1))
     else:
-        depth = min(8, max(6, requested_detail - 2))
+        depth = min(max_depth, max(6, requested_detail - 2))
 
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
         processed_cloud,
@@ -609,21 +622,20 @@ def reconstruct_with_poisson(processed_cloud, profile: str, params: Dict[str, An
 
     densities_array = np.asarray(densities)
     if densities_array.size:
-        # Use conservative quantiles to preserve sparse but real temple geometry
-        # (damaged areas, fine spire detail) that higher thresholds would trim.
-        density_quantile = 0.003 if profile == "hq" else 0.006 if profile == "balanced" else 0.010
+        # Remove low-density vertices — these are Poisson "infill" faces that
+        # the algorithm creates to close hollow shapes (ring centres, cavities).
+        # They have near-zero density because no input points are near them.
+        # Raising the threshold to 20-30% aggressively removes the flat white
+        # caps and spiky bottom infill that Poisson adds to open/ring-shaped
+        # archaeological objects, without touching the real scan surface which
+        # has 5-20x higher density than the infill vertices.
+        density_quantile = 0.20 if profile == "hq" else 0.25 if profile == "balanced" else 0.30
         density_threshold = float(np.quantile(densities_array, density_quantile))
         low_density_vertices = densities_array < density_threshold
         mesh.remove_vertices_by_mask(low_density_vertices)
 
-    if len(mesh.triangles) > 0:
-        mesh = mesh.filter_smooth_laplacian(
-            number_of_iterations=1,
-            lambda_filter=0.25,
-        )
-        mesh.remove_degenerate_triangles()
-        mesh.remove_duplicated_triangles()
-        mesh.remove_unreferenced_vertices()
+    # NOTE: Laplacian smoothing intentionally removed — it destroys the worn-stone
+    # surface roughness of archaeological artefacts, making them look plastic/waxy.
 
     return mesh
 
@@ -790,6 +802,9 @@ def repair_mesh_holes_with_trimesh(mesh):
         repaired_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(repaired.vertices, dtype=np.float64))
         repaired_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(repaired.faces, dtype=np.int32))
         repaired_mesh.compute_vertex_normals()
+        # Restore original vertex colors that were stripped during trimesh conversion
+        if mesh.has_vertex_colors():
+            repaired_mesh = transfer_vertex_colors(repaired_mesh, mesh)
 
         return repaired_mesh, {
             "trimesh_fill_holes_used": True,
@@ -807,7 +822,7 @@ def repair_mesh_holes_with_trimesh(mesh):
 
 
 def maybe_repair_mesh_holes_with_trimesh(mesh, params: Dict[str, Any]):
-    if not params.get("enable_trimesh_repair", False):
+    if not params.get("enable_trimesh_repair", True):
         return mesh, {
             "trimesh_fill_holes_used": False,
             "trimesh_fill_holes_status": "skipped-fast-processing",
@@ -973,7 +988,7 @@ def central_hole_bbox_from_cloud(point_cloud, profile: str, params: Dict[str, An
 
 
 def fill_mesh_boundary_holes(mesh, color_reference_cloud, profile: str, params: Dict[str, Any]):
-    if not params.get("enable_boundary_hole_fill", False):
+    if not params.get("enable_boundary_hole_fill", True):
         return mesh, {
             "holes_closed": 0,
             "hole_fill_vertices": 0,
@@ -991,6 +1006,9 @@ def fill_mesh_boundary_holes(mesh, color_reference_cloud, profile: str, params: 
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
     mesh_center = vertices.mean(axis=0)
+    mesh_extent = float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
+    # Loops larger than this are the main structural void — leave for force_fill_central_void_cap
+    max_perimeter = mesh_extent * 1.6
 
     candidate_loops = []
     for loop in loops:
@@ -998,14 +1016,17 @@ def fill_mesh_boundary_holes(mesh, color_reference_cloud, profile: str, params: 
             continue
         loop_points = vertices[np.asarray(loop, dtype=np.int64)]
         perimeter = float(np.linalg.norm(np.diff(np.vstack([loop_points, loop_points[0]]), axis=0), axis=1).sum())
+        if perimeter > max_perimeter:
+            continue  # too large — skip, handled by void cap
         centrality = 1.0 / (1.0 + float(np.linalg.norm(loop_points.mean(axis=0) - mesh_center)))
         candidate_loops.append((perimeter * centrality, loop))
 
     if not candidate_loops:
         return mesh, {"holes_closed": 0, "hole_fill_vertices": 0}
 
-    candidate_loops.sort(reverse=True, key=lambda item: item[0])
-    max_holes = 1 if profile != "hq" else 2
+    # Sort smallest first — patch side holes, not the main opening
+    candidate_loops.sort(key=lambda item: item[0])
+    max_holes = 2 if profile != "hq" else 4
     new_vertices = vertices.tolist()
     new_triangles = triangles.tolist()
     patch_vertex_indices: List[int] = []
@@ -1030,9 +1051,9 @@ def fill_mesh_boundary_holes(mesh, color_reference_cloud, profile: str, params: 
     filled_mesh.remove_unreferenced_vertices()
     filled_mesh.compute_vertex_normals()
 
-    if len(patch_vertex_indices) > 0:
-        filled_mesh = filled_mesh.filter_smooth_laplacian(number_of_iterations=5, lambda_filter=0.5)
-        filled_mesh.compute_vertex_normals()
+    # NOTE: whole-mesh Laplacian smoothing removed — it caused rippling artifacts
+    # at the boundary between real scan geometry and the hole-fill patches.
+    filled_mesh.compute_vertex_normals()
 
     filled_mesh = transfer_vertex_colors(filled_mesh, color_reference_cloud)
     if filled_mesh.has_vertex_colors():
@@ -1070,107 +1091,182 @@ def force_fill_central_void_cap(mesh, color_reference_cloud, params: Dict[str, A
         }
 
     vertices = np.asarray(mesh.vertices)
-    bounds_min = vertices.min(axis=0)
-    bounds_max = vertices.max(axis=0)
-    extent = np.maximum(bounds_max - bounds_min, 1e-6)
-    best = None
+    mesh_center = vertices.mean(axis=0)
+    mesh_extent = float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
 
-    for axis in range(3):
-        other_axes = [item for item in range(3) if item != axis]
-        for side in (-1, 1):
-            threshold = (
-                bounds_max[axis] - extent[axis] * 0.22
-                if side > 0
-                else bounds_min[axis] + extent[axis] * 0.22
-            )
-            slice_mask = vertices[:, axis] >= threshold if side > 0 else vertices[:, axis] <= threshold
-            slice_points = vertices[slice_mask]
-            if len(slice_points) < 40:
+    # --- Step 1: find the INNER hole boundary loop ---
+    # For ring-shaped objects (e.g. amalaka) there are two boundary loops:
+    # the outer rim (large perimeter) and the inner hole (smaller perimeter).
+    # We want the inner hole — select the smallest significant & central loop.
+    rim_points = None
+    boundary_edges = detect_boundary_edges(mesh)
+    if len(boundary_edges) > 0:
+        loops = boundary_loops_from_edges(boundary_edges)
+        min_perimeter = mesh_extent * 0.10  # filter out tiny cracks
+        candidates = []
+        for loop in loops:
+            if len(loop) < 6:
                 continue
-
-            projected = slice_points[:, other_axes]
-            center_2d = np.median(projected, axis=0)
-            radii = np.linalg.norm(projected - center_2d, axis=1)
-            outer_radius = float(np.percentile(radii, 82))
-            inner_radius = float(np.percentile(radii, 18))
-            if outer_radius <= 1e-9:
+            lp = vertices[np.asarray(loop, dtype=np.int64)]
+            perimeter = float(np.linalg.norm(np.diff(np.vstack([lp, lp[0]]), axis=0), axis=1).sum())
+            if perimeter < min_perimeter:
                 continue
+            loop_centroid = lp.mean(axis=0)
+            dist_from_center = float(np.linalg.norm(loop_centroid - mesh_center))
+            mean_radius = float(np.linalg.norm(lp - loop_centroid, axis=1).mean())
+            # Score: prefer small mean_radius (inner hole) and central position
+            score = 1.0 / (mean_radius * 0.8 + dist_from_center * 0.2 + 1e-9)
+            candidates.append((score, mean_radius, lp))
+        if candidates:
+            candidates.sort(reverse=True, key=lambda x: x[0])
+            rim_points = candidates[0][2]
 
-            hole_ratio = inner_radius / outer_radius
-            score = hole_ratio * len(slice_points)
-            if hole_ratio < float(params.get("central_void_min_ratio", 0.18)):
-                continue
-            if best is None or score > best["score"]:
-                best = {
-                    "axis": axis,
-                    "side": side,
-                    "other_axes": other_axes,
-                    "center_2d": center_2d,
-                    "plane": float(np.median(slice_points[:, axis])),
-                    "radius": max(inner_radius * 1.08, outer_radius * 0.22),
-                    "score": score,
-                    "hole_ratio": hole_ratio,
-                }
+    # --- Step 2: fallback — slice analysis, but snap plane to the actual face ---
+    if rim_points is None:
+        bounds_min = vertices.min(axis=0)
+        bounds_max = vertices.max(axis=0)
+        extent = np.maximum(bounds_max - bounds_min, 1e-6)
+        best = None
+        for axis in range(3):
+            other_axes = [item for item in range(3) if item != axis]
+            for side in (-1, 1):
+                threshold = (
+                    bounds_max[axis] - extent[axis] * 0.18
+                    if side > 0
+                    else bounds_min[axis] + extent[axis] * 0.18
+                )
+                slice_mask = vertices[:, axis] >= threshold if side > 0 else vertices[:, axis] <= threshold
+                slice_pts = vertices[slice_mask]
+                if len(slice_pts) < 40:
+                    continue
+                projected = slice_pts[:, other_axes]
+                center_2d = np.median(projected, axis=0)
+                radii = np.linalg.norm(projected - center_2d, axis=1)
+                outer_r = float(np.percentile(radii, 85))
+                inner_r = float(np.percentile(radii, 15))
+                if outer_r <= 1e-9:
+                    continue
+                hole_ratio = inner_r / outer_r
+                if hole_ratio < float(params.get("central_void_min_ratio", 0.15)):
+                    continue
+                score = hole_ratio * len(slice_pts)
+                if best is None or score > best["score"]:
+                    best = {
+                        "axis": axis, "side": side, "other_axes": other_axes,
+                        "center_2d": center_2d,
+                        # Snap plane to the actual open face, not the median
+                        "plane": float(bounds_max[axis] if side > 0 else bounds_min[axis]),
+                        "radius": inner_r * 1.02,
+                        "score": score, "hole_ratio": hole_ratio,
+                    }
+        if best is None:
+            return mesh, o3d.geometry.TriangleMesh(), {
+                "central_void_cap_used": False,
+                "central_void_cap_status": "no-void-candidate",
+            }
+        axis, other_axes = best["axis"], best["other_axes"]
+        plane_val, center_2d, radius_fallback = best["plane"], best["center_2d"], best["radius"]
+        n_synth = 64
+        synth_pts = []
+        for idx in range(n_synth):
+            angle = (2.0 * math.pi * idx) / n_synth
+            p = np.zeros(3)
+            p[axis] = plane_val
+            p[other_axes[0]] = center_2d[0] + math.cos(angle) * radius_fallback
+            p[other_axes[1]] = center_2d[1] + math.sin(angle) * radius_fallback
+            synth_pts.append(p)
+        rim_points = np.asarray(synth_pts, dtype=np.float64)
 
-    if best is None:
+    # --- Step 3: build plane from rim via PCA ---
+    centroid = rim_points.mean(axis=0)
+    centered = rim_points - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    normal = vh[-1]
+    u_axis = vh[0]
+    v_axis = vh[1]
+    if np.dot(normal, centroid - mesh_center) < 0:
+        normal = -normal
+
+    rim_2d = np.stack([centered @ u_axis, centered @ v_axis], axis=1)
+    mean_r = float(np.linalg.norm(rim_2d, axis=1).mean())
+    if mean_r < 1e-9:
         return mesh, o3d.geometry.TriangleMesh(), {
             "central_void_cap_used": False,
-            "central_void_cap_status": "no-central-void-candidate",
+            "central_void_cap_status": "degenerate-rim",
         }
 
-    segments = int(params.get("central_void_cap_segments", 48))
-    segments = max(24, min(segments, 96))
-    axis = best["axis"]
-    other_axes = best["other_axes"]
-    plane = best["plane"]
-    radius = best["radius"]
-    center_2d = best["center_2d"]
+    # --- Step 4: build concentric 3-ring disc (avoids starburst fan pattern) ---
+    segments = min(max(int(params.get("central_void_cap_segments", 64)), 32), 128)
+    ring_fractions = (0.30, 0.60, 1.00)
 
-    cap_vertices = []
-    center_3d = np.zeros(3, dtype=np.float64)
-    center_3d[axis] = plane
-    center_3d[other_axes] = center_2d
-    cap_vertices.append(center_3d)
+    all_verts: List[np.ndarray] = [centroid.copy()]  # index 0: center
+    ring_start = [1]
+    for frac in ring_fractions:
+        r = mean_r * frac
+        for i in range(segments):
+            angle = (2.0 * math.pi * i) / segments
+            p = centroid + u_axis * math.cos(angle) * r + v_axis * math.sin(angle) * r
+            all_verts.append(p)
+        ring_start.append(ring_start[-1] + segments)
 
-    for index in range(segments):
-        angle = (2.0 * math.pi * index) / segments
-        point = center_3d.copy()
-        point[other_axes[0]] = center_2d[0] + math.cos(angle) * radius
-        point[other_axes[1]] = center_2d[1] + math.sin(angle) * radius
-        cap_vertices.append(point)
+    def ridx(ring: int, i: int) -> int:
+        return ring_start[ring] + (i % segments)
 
-    cap_triangles = []
-    for index in range(segments):
-        a = 0
-        b = index + 1
-        c = 1 if index == segments - 1 else index + 2
-        cap_triangles.append([a, b, c] if best["side"] > 0 else [a, c, b])
+    tris: List[List[int]] = []
+    # Center → inner ring
+    for i in range(segments):
+        tris.append([0, ridx(0, i), ridx(0, i + 1)])
+    # Each pair of adjacent rings
+    for ring in range(len(ring_fractions) - 1):
+        for i in range(segments):
+            tris.append([ridx(ring, i), ridx(ring + 1, i), ridx(ring + 1, i + 1)])
+            tris.append([ridx(ring, i), ridx(ring + 1, i + 1), ridx(ring, i + 1)])
+
+    cap_verts_np = np.asarray([v.tolist() for v in all_verts], dtype=np.float64)
+    cap_tris_np = np.asarray(tris, dtype=np.int32)
 
     cap_mesh = o3d.geometry.TriangleMesh()
-    cap_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(cap_vertices, dtype=np.float64))
-    cap_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(cap_triangles, dtype=np.int32))
-    cap_mesh.compute_vertex_normals()
+    cap_mesh.vertices = o3d.utility.Vector3dVector(cap_verts_np)
+    cap_mesh.triangles = o3d.utility.Vector3iVector(cap_tris_np)
+    cap_mesh.remove_degenerate_triangles()
 
-    base_color = np.array([0.42, 0.40, 0.34], dtype=np.float64)
+    # Determine outward direction and fix winding
+    outward_dir = centroid - mesh_center
+    outward_hat = outward_dir / (np.linalg.norm(outward_dir) + 1e-9)
+    cap_mesh.compute_triangle_normals()
+    tris_arr = np.asarray(cap_mesh.triangles, dtype=np.int32)
+    if len(cap_mesh.triangle_normals) > 0:
+        avg_n = np.asarray(cap_mesh.triangle_normals).mean(axis=0)
+        if np.dot(avg_n, outward_dir) < 0:
+            tris_arr = tris_arr[:, ::-1]
+            cap_mesh.triangles = o3d.utility.Vector3iVector(tris_arr)
+
+    # Force ALL vertex normals to the flat plane normal — eliminates the
+    # starburst shading artifact caused by per-triangle normal divergence.
+    flat_normals = np.tile(outward_hat.reshape(1, 3), (len(all_verts), 1))
+    cap_mesh.vertex_normals = o3d.utility.Vector3dVector(flat_normals)
+
+    # --- Step 5: color — sample from nearby reference cloud ---
+    base_color = np.array([0.58, 0.55, 0.49], dtype=np.float64)
     if color_reference_cloud.has_colors() and len(color_reference_cloud.colors) > 0:
-        reference_colors = np.asarray(color_reference_cloud.colors)
-        reference_points = np.asarray(color_reference_cloud.points)
-        if len(reference_points) > 0:
-            reference_cloud = color_reference_cloud
-            tree = o3d.geometry.KDTreeFlann(reference_cloud)
-            sampled_colors = []
-            for point in cap_vertices[1:: max(1, segments // 12)]:
-                _, indices, _ = tree.search_knn_vector_3d(point, 3)
-                sampled_colors.extend(reference_colors[indices])
-            if sampled_colors:
-                base_color = np.mean(np.asarray(sampled_colors), axis=0)
+        tree = o3d.geometry.KDTreeFlann(color_reference_cloud)
+        ref_colors = np.asarray(color_reference_cloud.colors)
+        samples = []
+        outer_ring_start = ring_start[-2]
+        for pt in cap_verts_np[outer_ring_start: outer_ring_start + segments: max(1, segments // 16)]:
+            _, idxs, _ = tree.search_knn_vector_3d(pt, 8)
+            sampled = ref_colors[idxs].mean(axis=0)
+            sampled = np.clip(sampled, 0.28, 1.0)
+            samples.append(sampled)
+        if samples:
+            base_color = np.mean(np.asarray(samples), axis=0)
+    base_color = np.clip(base_color, 0.38, 1.0)
 
-    rng = np.random.default_rng(7)
+    rng = np.random.default_rng(42)
     cap_colors = []
-    for index in range(len(cap_vertices)):
-        moss = np.array([0.05, 0.16, 0.04]) * (0.25 + 0.75 * (index % 5 == 0))
-        noise = rng.normal(0.0, 0.028, size=3)
-        cap_colors.append(np.clip(base_color * 0.88 + moss + noise, 0.0, 1.0))
+    for i in range(len(all_verts)):
+        noise = rng.normal(0.0, 0.018, size=3)
+        cap_colors.append(np.clip(base_color + noise, 0.0, 1.0))
     cap_mesh.vertex_colors = o3d.utility.Vector3dVector(np.asarray(cap_colors, dtype=np.float64))
 
     combined = mesh + cap_mesh
@@ -1185,12 +1281,10 @@ def force_fill_central_void_cap(mesh, color_reference_cloud, params: Dict[str, A
 
     return combined, red_region, {
         "central_void_cap_used": True,
-        "central_void_cap_axis": int(axis),
-        "central_void_cap_side": int(best["side"]),
-        "central_void_cap_vertices": int(len(cap_vertices)),
-        "central_void_cap_triangles": int(len(cap_triangles)),
-        "central_void_hole_ratio": round(float(best["hole_ratio"]), 4),
-        "central_void_cap_radius": round(float(radius), 6),
+        "central_void_cap_vertices": int(len(all_verts)),
+        "central_void_cap_triangles": int(len(tris)),
+        "central_void_rim_points": int(len(rim_points)),
+        "central_void_cap_radius": round(float(mean_r), 6),
     }
 
 
@@ -1444,7 +1538,7 @@ async def run_reconstruction(job_id: str, model: str, params: Dict[str, Any]) ->
             reconstruction_cloud,
         )
 
-        if reconstruction_mode == "geometry_only" and params.get("output_surface_mesh", False) is not True:
+        if reconstruction_mode == "geometry_only" and params.get("output_surface_mesh", True) is False:
             update_status(78, "Writing cleaned point cloud")
             await broadcast_job_update(job_id)
 
