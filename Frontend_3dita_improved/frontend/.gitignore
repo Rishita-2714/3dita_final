@@ -1,0 +1,8 @@
+node_modules/ 
+dist/ 
+.env.local 
+.env 
+vite-dev-4174.err 
+vite-dev-4174.log 
+vite-dev.err 
+vite-dev.log 

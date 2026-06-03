@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+venv/
+.venv/
+env/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Frontend build output and caches
+dist/
+build/
+.vite/
+.next/
+coverage/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.err
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generated/mock assets
+backend/static/mock/
+**/backend/static/mock/
+frontend/public/mock/
+**/frontend/public/mock/
+*.ply
+*.tar
+*.tar.gz
+*~
+docx_extract_tmp/
