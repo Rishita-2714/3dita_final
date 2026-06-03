@@ -65,9 +65,9 @@ function SurfaceMesh({ geometry, mode, hasVertexColors, colorOverride }) {
     <mesh geometry={geometry} castShadow receiveShadow>
       <meshStandardMaterial
         color={color}
-        roughness={isAdded ? 0.82 : 1.0}
+        roughness={isAdded ? 0.82 : mode === "after" ? 0.72 : 1.0}
         metalness={0}
-        flatShading={!isContext && !isAdded}
+        flatShading={false}
         vertexColors={useVertexColors}
         side={DoubleSide}
         wireframe={isContext}

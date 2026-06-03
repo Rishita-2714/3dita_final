@@ -634,6 +634,11 @@ def reconstruct_with_poisson(processed_cloud, profile: str, params: Dict[str, An
         low_density_vertices = densities_array < density_threshold
         mesh.remove_vertices_by_mask(low_density_vertices)
 
+    # Recompute normals after removing low-density vertices — removal can leave
+    # normals pointing inward on newly exposed boundary faces, causing dark patches.
+    if not mesh.is_empty():
+        mesh.compute_vertex_normals()
+
     # NOTE: Laplacian smoothing intentionally removed — it destroys the worn-stone
     # surface roughness of archaeological artefacts, making them look plastic/waxy.
 
